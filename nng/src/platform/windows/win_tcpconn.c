@@ -1,0 +1,455 @@
+//
+// Copyright 2026 Staysail Systems, Inc. <info@staysail.tech>
+// Copyright 2018 Capitar IT Group BV <info@capitar.com>
+// Copyright 2018 Devolutions <info@devolutions.net>
+//
+// This software is supplied under the terms of the MIT License, a
+// copy of which should be located in the distribution where this
+// file was obtained (LICENSE.txt).  A copy of the license may also be
+// found online at https://opensource.org/licenses/MIT.
+//
+
+#include "../../core/nng_impl.h"
+
+#include "win_tcp.h"
+
+#ifdef NNG_HAVE_UNIX_SOCKETS
+#include <afunix.h>
+#endif
+
+#include <stdio.h>
+
+static void
+tcp_recv_start(nni_tcp_conn *c)
+{
+	nni_aio *aio;
+	int      rv;
+	DWORD    niov;
+	DWORD    flags;
+	unsigned i;
+	unsigned naiov;
+	nni_iov *aiov;
+	WSABUF   iov[8]; // we don't support more than this
+	DWORD    nrecv;
+	size_t   count;
+
+	c->recv_rv = 0;
+	while ((aio = nni_list_first(&c->recv_aios)) != NULL) {
+
+		if (c->closed) {
+			nni_aio_list_remove(aio);
+			nni_aio_finish_error(aio, NNG_ECLOSED);
+			continue;
+		}
+		nni_aio_get_iov(aio, &naiov, &aiov);
+
+		// Put the AIOs in Windows form.
+		count        = 0;
+		bool clamped = false;
+		for (niov = 0, i = 0; !clamped && i < naiov; i++) {
+			if (aiov[i].iov_len != 0) {
+				size_t len = aiov[i].iov_len;
+				clamped =
+				    nni_aio_iov_clamp_len(&len, &count);
+				iov[niov].buf = aiov[i].iov_buf;
+				iov[niov].len = (ULONG) len;
+				niov++;
+			}
+		}
+
+		c->recving = true;
+		flags      = 0;
+		rv         = WSARecv(
+                    c->s, iov, niov, &nrecv, &flags, &c->recv_io.olpd, NULL);
+
+		if ((rv == SOCKET_ERROR) &&
+		    ((rv = GetLastError()) != ERROR_IO_PENDING)) {
+			// Synchronous error.
+			c->recving = false;
+			nni_aio_list_remove(aio);
+			nni_aio_finish_error(aio, nni_win_error(rv));
+		} else {
+			// Callback completes.
+			return;
+		}
+	}
+
+	// we received all pending requests
+	nni_cv_wake(&c->cv);
+}
+
+static void
+tcp_recv_cb(nni_win_io *io, int rv, size_t num)
+{
+	nni_aio      *aio;
+	nni_tcp_conn *c = io->ptr;
+
+	nni_mtx_lock(&c->mtx);
+	aio = nni_list_first(&c->recv_aios);
+	NNI_ASSERT(aio != NULL);
+
+	if (c->recv_rv != 0) {
+		rv         = c->recv_rv;
+		c->recv_rv = 0;
+	}
+	if ((rv == 0) && (num == 0)) {
+		// A zero byte receive is a remote close from the peer.
+		rv = NNG_ECONNSHUT;
+	}
+	c->recving = false;
+	nni_aio_list_remove(aio);
+	tcp_recv_start(c);
+	nni_mtx_unlock(&c->mtx);
+
+	nni_aio_finish_sync(aio, rv, num);
+}
+
+static void
+tcp_recv_cancel(nni_aio *aio, void *arg, nng_err rv)
+{
+	nni_tcp_conn *c = arg;
+	nni_mtx_lock(&c->mtx);
+	if ((aio == nni_list_first(&c->recv_aios)) && (c->recv_rv == 0)) {
+		c->recv_rv = rv;
+		CancelIoEx((HANDLE) c->s, &c->recv_io.olpd);
+	} else {
+		nni_aio *srch;
+		NNI_LIST_FOREACH (&c->recv_aios, srch) {
+			if (aio == srch) {
+				nni_aio_list_remove(aio);
+				nni_aio_finish_error(aio, rv);
+				nni_cv_wake(&c->cv);
+				break;
+			}
+		}
+	}
+	nni_mtx_unlock(&c->mtx);
+}
+
+static void
+tcp_recv(void *arg, nni_aio *aio)
+{
+	nni_tcp_conn *c = arg;
+
+	nni_aio_reset(aio);
+	nni_mtx_lock(&c->mtx);
+	if (!nni_aio_start(aio, tcp_recv_cancel, c)) {
+		nni_mtx_unlock(&c->mtx);
+		return;
+	}
+	nni_list_append(&c->recv_aios, aio);
+	if (aio == nni_list_first(&c->recv_aios)) {
+		tcp_recv_start(c);
+	}
+	nni_mtx_unlock(&c->mtx);
+}
+
+static void
+tcp_send_start(nni_tcp_conn *c)
+{
+	nni_aio *aio;
+	int      rv;
+	DWORD    niov;
+	size_t   count;
+	unsigned i;
+	unsigned naiov;
+	nni_iov *aiov;
+	WSABUF   iov[8];
+
+	while ((aio = nni_list_first(&c->send_aios)) != NULL) {
+		if (c->closed) {
+			nni_aio_list_remove(aio);
+			nni_aio_finish_error(aio, NNG_ECLOSED);
+			continue;
+		}
+		nni_aio_get_iov(aio, &naiov, &aiov);
+
+		// Put the AIOs in Windows form.
+		count        = 0;
+		bool clamped = false;
+		for (niov = 0, i = 0; !clamped && i < naiov; i++) {
+			if (aiov[i].iov_len != 0) {
+				size_t len = aiov[i].iov_len;
+				clamped =
+				    nni_aio_iov_clamp_len(&len, &count);
+				iov[niov].buf = aiov[i].iov_buf;
+				iov[niov].len = (ULONG) len;
+				niov++;
+			}
+		}
+
+		c->sending = true;
+		rv = WSASend(c->s, iov, niov, NULL, 0, &c->send_io.olpd, NULL);
+
+		if ((rv == SOCKET_ERROR) &&
+		    ((rv = GetLastError()) != ERROR_IO_PENDING)) {
+			// Synchronous failure.
+			c->sending = false;
+			nni_aio_list_remove(aio);
+			nni_aio_finish_error(aio, nni_win_error(rv));
+		} else {
+			return;
+		}
+	}
+	nni_cv_wake(&c->cv);
+}
+
+static void
+tcp_send_cancel(nni_aio *aio, void *arg, nng_err rv)
+{
+	nni_tcp_conn *c = arg;
+	nni_mtx_lock(&c->mtx);
+	if (aio == nni_list_first(&c->send_aios)) {
+		c->send_rv = rv;
+		CancelIoEx((HANDLE) c->s, &c->send_io.olpd);
+	} else {
+		nni_aio *srch;
+		NNI_LIST_FOREACH (&c->send_aios, srch) {
+			if (srch == aio) {
+				nni_aio_list_remove(aio);
+				nni_aio_finish_error(aio, rv);
+				nni_cv_wake(&c->cv);
+				break;
+			}
+		}
+	}
+	nni_mtx_unlock(&c->mtx);
+}
+
+static void
+tcp_send_cb(nni_win_io *io, int rv, size_t num)
+{
+	nni_aio      *aio;
+	nni_tcp_conn *c = io->ptr;
+	nni_mtx_lock(&c->mtx);
+	aio = nni_list_first(&c->send_aios);
+	NNI_ASSERT(aio != NULL);
+	nni_aio_list_remove(aio); // should always be at head
+	c->sending = false;
+
+	if (c->send_rv != 0) {
+		rv         = c->send_rv;
+		c->send_rv = 0;
+	}
+	tcp_send_start(c);
+	nni_mtx_unlock(&c->mtx);
+
+	nni_aio_finish_sync(aio, rv, num);
+}
+
+static void
+tcp_send(void *arg, nni_aio *aio)
+{
+	nni_tcp_conn *c = arg;
+
+	nni_aio_reset(aio);
+	nni_mtx_lock(&c->mtx);
+	if (!nni_aio_start(aio, tcp_send_cancel, c)) {
+		nni_mtx_unlock(&c->mtx);
+		return;
+	}
+	nni_list_append(&c->send_aios, aio);
+	if (aio == nni_list_first(&c->send_aios)) {
+		tcp_send_start(c);
+	}
+	nni_mtx_unlock(&c->mtx);
+}
+
+static void
+tcp_close(void *arg)
+{
+	nni_tcp_conn *c = arg;
+	nni_mtx_lock(&c->mtx);
+	if (!c->closed) {
+		SOCKET s = c->s;
+
+		c->closed = true;
+		c->s      = INVALID_SOCKET;
+
+		if (s != INVALID_SOCKET) {
+			CancelIoEx((HANDLE) s, &c->send_io.olpd);
+			CancelIoEx((HANDLE) s, &c->recv_io.olpd);
+			shutdown(s, SD_BOTH);
+			closesocket(s);
+		}
+	}
+	nni_mtx_unlock(&c->mtx);
+}
+
+static nng_err
+tcp_get_nodelay(void *arg, void *buf, size_t *szp, nni_type t)
+{
+	nni_tcp_conn *c   = arg;
+	BOOL          b   = 0;
+	int           bsz = sizeof(b);
+
+	if ((getsockopt(c->s, IPPROTO_TCP, TCP_NODELAY, (void *) &b, &bsz)) !=
+	    0) {
+		return (nni_win_error(WSAGetLastError()));
+	}
+	return (nni_copyout_bool(b, buf, szp, t));
+}
+
+static nng_err
+tcp_get_keepalive(void *arg, void *buf, size_t *szp, nni_type t)
+{
+	nni_tcp_conn *c   = arg;
+	BOOL          b   = 0;
+	int           bsz = sizeof(b);
+
+	if ((getsockopt(c->s, SOL_SOCKET, SO_KEEPALIVE, (void *) &b, &bsz)) !=
+	    0) {
+		return (nni_win_error(WSAGetLastError()));
+	}
+	return (nni_copyout_bool(b, buf, szp, t));
+}
+
+static nng_err
+tcp_get_peer_pid(void *arg, void *buf, size_t *szp, nni_type t)
+{
+	nni_tcp_conn *c = arg;
+
+#ifdef NNG_HAVE_UNIX_SOCKETS
+	ULONG id;
+	DWORD nbytes;
+
+	if (!c->peer_pid_supported) {
+		return (NNG_ENOTSUP);
+	}
+	if (WSAIoctl(c->s, SIO_AF_UNIX_GETPEERPID, NULL, 0, &id,
+	        sizeof(id), &nbytes, NULL, NULL) == SOCKET_ERROR) {
+		return (nni_win_error(WSAGetLastError()));
+	}
+	return (nni_copyout_int((int) id, buf, szp, t));
+#else
+	NNI_ARG_UNUSED(c);
+	NNI_ARG_UNUSED(buf);
+	NNI_ARG_UNUSED(szp);
+	NNI_ARG_UNUSED(t);
+	return (NNG_ENOTSUP);
+#endif
+}
+
+static const nng_sockaddr *
+tcp_self_addr(void *arg)
+{
+	nni_tcp_conn *c = arg;
+	return (&c->sockname);
+}
+
+static const nng_sockaddr *
+tcp_peer_addr(void *arg)
+{
+	nni_tcp_conn *c = arg;
+	return (&c->peername);
+}
+
+static const nni_option tcp_options[] = {
+	{
+	    .o_name = NNG_OPT_TCP_NODELAY,
+	    .o_get  = tcp_get_nodelay,
+	},
+	{
+	    .o_name = NNG_OPT_TCP_KEEPALIVE,
+	    .o_get  = tcp_get_keepalive,
+	},
+	{
+	    .o_name = NNG_OPT_PEER_PID,
+	    .o_get  = tcp_get_peer_pid,
+	},
+	{
+	    .o_name = NULL,
+	},
+};
+
+static nng_err
+tcp_get(void *arg, const char *name, void *buf, size_t *szp, nni_type t)
+{
+	nni_tcp_conn *c = arg;
+	return (nni_getopt(tcp_options, name, c, buf, szp, t));
+}
+
+static nng_err
+tcp_set(void *arg, const char *name, const void *buf, size_t sz, nni_type t)
+{
+	nni_tcp_conn *c = arg;
+	return (nni_setopt(tcp_options, name, c, buf, sz, t));
+}
+
+static void
+tcp_stop(void *arg)
+{
+	nni_tcp_conn *c = arg;
+	tcp_close(c);
+
+	nni_mtx_lock(&c->mtx);
+	while (c->recving || c->sending || (!nni_list_empty(&c->recv_aios)) ||
+	    (!nni_list_empty(&c->send_aios))) {
+		nni_cv_wait(&c->cv);
+	}
+	nni_mtx_unlock(&c->mtx);
+	if (c->s != INVALID_SOCKET) {
+		closesocket(c->s);
+	}
+}
+
+static void
+tcp_free(void *arg)
+{
+	nni_tcp_conn *c = arg;
+	tcp_stop(c);
+
+	nni_cv_fini(&c->cv);
+	nni_mtx_fini(&c->mtx);
+	NNI_FREE_STRUCT(c);
+}
+
+int
+nni_win_tcp_init(nni_tcp_conn **connp, SOCKET s, bool peer_pid_supported)
+{
+	nni_tcp_conn *c;
+	int           rv;
+	BOOL          yes;
+	DWORD         no;
+
+	// Don't inherit the handle (CLOEXEC really).
+	SetHandleInformation((HANDLE) s, HANDLE_FLAG_INHERIT, 0);
+
+	if ((c = NNI_ALLOC_STRUCT(c)) == NULL) {
+		return (NNG_ENOMEM);
+	}
+	c->s = INVALID_SOCKET;
+	nni_mtx_init(&c->mtx);
+	nni_cv_init(&c->cv, &c->mtx);
+	nni_aio_list_init(&c->recv_aios);
+	nni_aio_list_init(&c->send_aios);
+	c->conn_aio          = NULL;
+	c->peer_pid_supported = peer_pid_supported;
+	c->ops.s_close     = tcp_close;
+	c->ops.s_stop      = tcp_stop;
+	c->ops.s_free      = tcp_free;
+	c->ops.s_send      = tcp_send;
+	c->ops.s_recv      = tcp_recv;
+	c->ops.s_get       = tcp_get;
+	c->ops.s_set       = tcp_set;
+	c->ops.s_peer_addr = tcp_peer_addr;
+	c->ops.s_self_addr = tcp_self_addr;
+
+	nni_win_io_init(&c->recv_io, tcp_recv_cb, c);
+	nni_win_io_init(&c->send_io, tcp_send_cb, c);
+	if ((rv = nni_win_io_register((HANDLE) s)) != 0) {
+		tcp_free(c);
+		return (rv);
+	}
+
+	no = 0;
+	(void) setsockopt(
+	    s, IPPROTO_IPV6, IPV6_V6ONLY, (char *) &no, sizeof(no));
+	yes = 1;
+	(void) setsockopt(
+	    s, IPPROTO_TCP, TCP_NODELAY, (char *) &yes, sizeof(yes));
+
+	c->s   = s;
+	*connp = c;
+	return (0);
+}
