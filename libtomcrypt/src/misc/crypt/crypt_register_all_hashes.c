@@ -1,0 +1,122 @@
+/* LibTomCrypt, modular cryptographic library -- Tom St Denis */
+/* SPDX-License-Identifier: Unlicense */
+
+#include "tomcrypt_private.h"
+
+/**
+  @file crypt_register_all_hashes.c
+
+  Steffen Jaeckel
+*/
+
+#define REGISTER_HASH(h) do {\
+   LTC_ARGCHK(register_hash(h) != -1); \
+} while(0)
+
+int register_all_hashes(void)
+{
+#ifdef LTC_SHA512
+   /* `sha512_desc` does the multiplexing into `sha512_x86_desc` resp. `sha512_portable_desc` depending on the capabilities of the CPU. */
+   REGISTER_HASH(&sha512_desc);
+#endif
+#ifdef LTC_SHA256
+   /* `sha256_desc` does the multiplexing into `sha256_x86_desc` resp. `sha256_portable_desc`
+    * depending on the capabilities of the CPU.
+    */
+   REGISTER_HASH(&sha256_desc);
+#endif
+#ifdef LTC_SHA3
+   REGISTER_HASH(&sha3_512_desc);
+   REGISTER_HASH(&sha3_384_desc);
+   REGISTER_HASH(&sha3_256_desc);
+   REGISTER_HASH(&sha3_224_desc);
+   REGISTER_HASH(&shake128_desc);
+   REGISTER_HASH(&shake256_desc);
+#endif
+#ifdef LTC_SHA512_256
+   /* `sha512_256_desc` does the multiplexing into `sha512_256_x86_desc` resp. `sha512_256_portable_desc` depending on the capabilities of the CPU. */
+   REGISTER_HASH(&sha512_256_desc);
+#endif
+#ifdef LTC_SHA512_224
+   /* `sha512_224_desc` does the multiplexing into `sha512_224_x86_desc` resp. `sha512_224_portable_desc` depending on the capabilities of the CPU. */
+   REGISTER_HASH(&sha512_224_desc);
+#endif
+#ifdef LTC_SHA224
+   /* `sha224_desc` does the multiplexing into `sha224_x86_desc` resp. `sha224_portable_desc`
+    * depending on the capabilities of the CPU.
+    */
+   REGISTER_HASH(&sha224_desc);
+#endif
+#ifdef LTC_SHA384
+   /* `sha384_desc` does the multiplexing into `sha384_x86_desc` resp. `sha384_portable_desc` depending on the capabilities of the CPU. */
+   REGISTER_HASH(&sha384_desc);
+#endif
+#ifdef LTC_SHA1
+   /* `sha1_desc` does the multiplexing into `sha1_x86_desc` resp. `sha1_portable_desc`
+    * depending on the capabilities of the CPU.
+    */
+   REGISTER_HASH(&sha1_desc);
+#endif
+#ifdef LTC_MD5
+   REGISTER_HASH(&md5_desc);
+#endif
+#ifdef LTC_BLAKE2S
+   REGISTER_HASH(&blake2s_128_desc);
+   REGISTER_HASH(&blake2s_160_desc);
+   REGISTER_HASH(&blake2s_224_desc);
+   REGISTER_HASH(&blake2s_256_desc);
+#endif
+#ifdef LTC_BLAKE2B
+   REGISTER_HASH(&blake2b_160_desc);
+   REGISTER_HASH(&blake2b_256_desc);
+   REGISTER_HASH(&blake2b_384_desc);
+   REGISTER_HASH(&blake2b_512_desc);
+#endif
+#ifdef LTC_BLAKE3
+   REGISTER_HASH(&blake3_desc);
+#endif
+#ifdef LTC_KECCAK
+   REGISTER_HASH(&keccak224_desc);
+   REGISTER_HASH(&keccak256_desc);
+   REGISTER_HASH(&keccak384_desc);
+   REGISTER_HASH(&keccak512_desc);
+#endif
+#ifdef LTC_RIPEMD128
+   REGISTER_HASH(&rmd128_desc);
+#endif
+#ifdef LTC_RIPEMD160
+   REGISTER_HASH(&rmd160_desc);
+#endif
+#ifdef LTC_RIPEMD256
+   REGISTER_HASH(&rmd256_desc);
+#endif
+#ifdef LTC_RIPEMD320
+   REGISTER_HASH(&rmd320_desc);
+#endif
+#ifdef LTC_WHIRLPOOL
+   REGISTER_HASH(&whirlpool_desc);
+#endif
+#ifdef LTC_TIGER
+   REGISTER_HASH(&tiger_desc);
+   REGISTER_HASH(&tiger2_desc);
+#endif
+#ifdef LTC_MD2
+   REGISTER_HASH(&md2_desc);
+#endif
+#ifdef LTC_MD4
+   REGISTER_HASH(&md4_desc);
+#endif
+#ifdef LTC_SM3
+   REGISTER_HASH(&sm3_desc);
+#endif
+#ifdef LTC_CHC_HASH
+   {
+      int aes_index = find_cipher_any("aes", 8, 16);
+      if (aes_index != -1) {
+         REGISTER_HASH(&chc_desc);
+         LTC_ARGCHK(chc_register(aes_index) == CRYPT_OK);
+      }
+   }
+#endif
+   return CRYPT_OK;
+}
